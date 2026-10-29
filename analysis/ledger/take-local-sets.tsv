@@ -1,0 +1,26 @@
+# 課題集合 t3-verbswap-take（src/make_verbswap_sets.py が書く）。列は ops/data/eval-local-sets.tsv と同じ
+t3-verbswap-take	select	=1	=0	t3takew-k1p-dir-0303-v2
+t3-verbswap-take	select	=1	=0	t3takew-k1p-dir-0311-v2
+t3-verbswap-take	select	=1	=0	t3takew-k1p-dir-0321-v2
+t3-verbswap-take	select	=1	=0	t3takew-k1p-dir-sw-0307-v2
+t3-verbswap-take	select	=1	=0	t3takew-k1p-dir-sw-0316-v2
+t3-verbswap-take	select	=1	=0	t3takew-k1p-dir-sw-0318-v2
+t3-verbswap-take	select	=1	=0	t3takew-k1p-loc-0326-v2
+t3-verbswap-take	select	=1	=0	t3takew-k1p-loc-0327-v2
+t3-verbswap-take	select	=1	=0	t3takew-k1p-loc-0328-v2
+t3-verbswap-take	select	=1	=0	t3takew-k1p-loc-0334-v2
+t3-verbswap-take	select	=1	=0	t3takew-k1p-loc-sw-0302-v2
+t3-verbswap-take	select	=1	=0	t3takew-k1p-loc-sw-0333-v2
+t3-verbswap-take	select	=1	=0	t3takew-lr4-dir-0305-v2
+t3-verbswap-take	select	=1	=0	t3takew-lr4-dir-0309-v2
+t3-verbswap-take	select	=1	=0	t3takew-lr4-dir-0323-v2
+t3-verbswap-take	select	=1	=0	t3takew-lr4-dir-0326-v2
+t3-verbswap-take	select	=1	=0	t3takew-lr4-loc-0312-v2
+t3-verbswap-take	select	=1	=0	t3takew-lr4-loc-0314-v2
+t3-verbswap-take	select	=1	=0	t3takew-lr4-loc-0322-v2
+t3-verbswap-take	select	=1	=0	t3takew-lr4-loc-0323-v2
+t3-verbswap-take	select	=1	=0	t3takew-lr4-loc-0329-v2
+t3-verbswap-take	select	=1	=0	t3takew-lr4-loc-0335-v2
+t3-verbswap-take	select	=1	=0	t3takew-lr4-loc-0336-v2
+t3-verbswap-take	select	=1	=0	t3takew-lr4-loc-0338-v2
+t3-verbswap-take	select	=1	=0	t3takew-lr4-loc-0339-v2

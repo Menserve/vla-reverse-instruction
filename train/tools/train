@@ -1,0 +1,941 @@
+#!/usr/bin/env bash
+# tools/train — π0.5 LoRA を container で学習する。
+#
+# 抜き出し元（本選1 の 5090 学習 script、113 行）と経緯は work/tools-train/extract.md。
+# 2026-09-23 に Pro6000（切り離し起動・再開・言語 block・alpha・W&B online）を足した。
+# 経緯は work/tools-train/pro6000-resume.md、差の測定は work/tools-train/pro6000-gap.md。
+# **新しい引数を渡さなければ、container の引数列は抽出元と 1 文字も変わらない。**
+# packet 固有の値（出力先・dataset・base・staging・repo_id・container 名・job 名・image・timeout）を
+# 引数へ出し、BLOCKS の regex と期待値と rank を設定ファイル（既定 tools/train-blocks.tsv）へ出した。
+# **呼ぶ 2 本は写していない。**expected_block_trainable.py（起動前の numel）と
+# check_adapter_modules.sh（学習後の adapter の module 数）を、そのまま呼ぶ。
+#
+# packet 名・lane 名・日付・課題名・repo_id・staging の path をこの file の中に持たない。
+#
+# 実際に学習するときは runner を通す（門: RUN_JOB_GUARD=1 が無ければ exit 2）:
+#   scripts/run_job.sh <名前> --proof 'TRAIN_START' --proof-timeout 900 \
+#       --proof-file <out-root>/<id>/arm.log -- tools/train --id <id> ...
+# --dry-run は門を通さずに検査だけを行い、組んだ引数列を stdout に出す（docker を起動しない）。
+#
+# 出力（--out-root と --id から道具が決める。既にあれば止まる。--resume のときは既にあること）:
+#   <out-root>/<id>/arm.log        節目（TRAIN_START / TRAIN_FAIL / TRAIN_DONE）と adapter 検査
+#   <out-root>/<id>/train.log      lerobot-train の生ログ（loss はここ。名前は --log-name）
+#   <out-root>/<id>/manifest.json  入力の sha・道具の版・引数・container の引数列
+#                                  （--resume のときは manifest-resume-<再開元の step>.json）
+#   <out-root>/<id>/train-output/  checkpoints（container の /run/train-output）
+#   --detach のときは更に:
+#   <out-root>/<id>/<container 名>.rc   container 自身が書いた終了コード。**消さない**
+#   <out-root>/<id>/containers.tsv      起動した container の一覧（起動の直前に書く）
+#   <out-root>/<id>/container-exits.tsv 回収した終了コード
+#
+# **この道具が見ないもの**（呼ぶ側の責任）:
+#   - 走行中の見張り。num_learnable_params・OOM・非有限値は見ない。
+#     **Pro6000 で回すときは scripts/train_pro6000_canonical.sh の observe_guard を一緒に走らせる。**
+#     再開で adapter が凍ったまま走る事故を本番で捕まえるのはこの見張りだけ。
+#   - 再開先の checkpoint が読めるか。先に
+#     `scripts/train_pro6000_canonical.sh --verify-checkpoints` と `--load-test` を回す。
+#   - 出力先が揮発する置き場かどうか。**終了コードの file が残るのは、揮発しない側に
+#     --out-root を置いたときだけ。**node ごと止まれば揮発側は消える。
+#   - 回収のとき docker には訊かない（rc file だけを読む）。走ったままの container は見つけない。
+set -Eeuo pipefail
+
+TOOL_TAG=train
+# runner は script を snapshot へ複製して走らせる。snapshot の隣に lib/ は無いので、そのときだけ元の path
+# （RUN_JOB_SCRIPT）から辿る。別の script の中から呼ばれたときは RUN_JOB_SCRIPT がその script を指すので使わない
+TOOL_DIR=$(cd "$(dirname "$0")" && pwd)
+[ -f "$TOOL_DIR/lib/common.sh" ] || TOOL_DIR=$(cd "$(dirname "${RUN_JOB_SCRIPT:?lib/common.sh が見つからない}")" && pwd)
+. "$TOOL_DIR/lib/common.sh"
+
+usage() {
+  cat <<'USAGE'
+usage: tools/train --id <id> --blocks <name> --dataset <dir> --base <dir> --out-root <dir>
+                   --inventory <file> --staging <dir> --repo-id <s> [options] [--dry-run]
+
+必須:
+  --id <id>              出力先の名前。<out-root>/<id> になる
+  --blocks <name>        解凍する block。--blocks-config の 1 列目（既定の設定では D|V|VA|VD|VMDLmL|M）
+  --dataset <dir>        staged dataset。container の /staging/dataset
+  --base <dir>           土台の重み。container の /base（--policy.pretrained_path）
+  --out-root <dir>       出力の根。<id> をこの下に作る
+  --inventory <file>     module inventory。起動前に BLOCKS の numel を突き合わせる
+  --staging <dir>        lerobot と HF cache を持つ dir（<staging>/lerobot と <staging>/data/hf を mount）
+  --repo-id <s>          --dataset.repo_id
+
+任意（既定は抽出元と同じ）:
+  --steps N              800（--policy.scheduler_decay_steps も同じ値）
+  --batch N              6（物理 batch）
+  --grad-accum N         21（container へ LEROBOT_GRAD_ACCUM で渡す）
+  --seed N               1000
+  --save-freq N          200
+  --warmup N             20
+  --peak-lr X            1e-4（--dpo のときの既定は 2.5e-5。--decay-lr と両方渡したときだけ、その値）
+  --decay-lr X           1e-4（peak と同値 = warmup 後は定数 lr。--dpo のときの既定は 2.5e-6。--peak-lr と両方渡したときだけ、その値）
+  --log-freq N           100（--log_freq）
+  --image NAME           parc2026:latest
+  --timeout DUR          6h（timeout(1) の書式。--detach とは同時に渡せない）
+  --container-name S     train-<id>
+  --job-name S           <id>-<steps>
+  --log-name S           train.log（container が書く生ログの名前）
+  --blocks-config FILE   tools/train-blocks.tsv
+  --trainable-script F   scripts/expected_block_trainable.py（repo 根から。写さず呼ぶ）
+  --check-script F       scripts/check_adapter_modules.sh（repo 根から。写さず呼ぶ）
+  --dpo                  DPO entry 用設定（--entry dpo_training_entry.py と --blocks D が要る）
+  --dpo-beta X           DPO beta（既定 200。--dpo のときだけ）
+  --dpo-lambda X         安全側 SFT 項の重み（既定 20。--dpo のときだけ）
+  --dpo-steps N          DPO step 数（既定 1,200。launcher の --steps に自動反映し、明示値との不一致は拒否）
+  --dry-run              検査だけ行い、docker の引数列を 1 行 1 引数で stdout に出す。門を通さない
+  --help
+
+渡したときだけ効く（渡さなければ container の引数列は抽出元と 1 文字も変わらない）:
+  --drop-n-last N|none   --policy.drop_n_last_frames=N。none ならこの欄を出さない（= pi05 の既定 49）。
+                         **必須。**渡し忘れると 0 のつもりが 49 で走るので、道具が止める
+                         （出さないと pi05 の既定 49 で走る。抽出元は 0 なので 0 を明示する）
+  --save-checkpoint B    --save_checkpoint=B（true|false）
+  --rank N               --blocks-config の rank 欄との照合用。違えば起動前に止まる
+  --allow-language-blocks  regex に language_model が入っていても通す（既定は止める）
+  --alpha N              LEROBOT_LORA_ALPHA。CLI に欄が無いので環境変数で渡す。--entry が要る
+  --entry FILE           入口の .py。<FILE の dir> を /runtime:ro に mount し、
+                         /staging/lerobot/.venv/bin/python /runtime/<FILE の名前> を叩く。
+                         HOME=/tmp/home と HF_LEROBOT_HOME=/tmp/lerobot-home も付く。--alpha が要る
+  --snapshot-src DIR     staging の symlink が指す HF snapshot の path に mount する元
+  --snapshot-dest PATH   その mount 先（container の中の path）。--snapshot-src と両方渡す。
+                         **--detach のときだけ mount される**ので、--detach なしでは止める
+  --exclude-episodes F   学習に使わない episode の一覧（json。tools/stage の --exclude-episodes と同じ形:
+                         {"episodes": [{"episode_index": N, ...}, ...]}）。dataset の meta/info.json の
+                         total_episodes から一覧の番号を除いた残りを <out>/episodes-used.json に書き、
+                         LEROBOT_TRAIN_EPISODES_JSON で入口に渡す。入口（tools/train-entry/train_entry.py）が
+                         学習の sampler の始点をその episode だけにする。**--entry が要る。**
+                         lerobot の --dataset.episodes は使わない（この版では sampler と噛み合わず落ちる）
+  --lr-groups F          学習率の群の設定（json。{"groups": [{"name", "regex", "lr", "expect_numel"}, ...]}）。
+                         渡すと、学習する LoRA を module 名の正規表現で群に分け、群ごとの学習率で学習する
+                         （LEROBOT_LR_GROUPS_JSON=/run/lr-groups.json で入口に渡す。設定の写しを <out>/lr-groups.json に置く）。
+                         起動の前に、設定を inventory で照合する（群が --blocks の module をちょうど 1 回ずつ分ける・
+                         群ごとの parameter 数が expect_numel と一致・合計が --blocks の期待値と一致・
+                         最も大きい群の lr が --peak-lr と一致）。合わなければ出力先を作る前に止まる。
+                         **渡さなければ container の引数列は 1 文字も変わらない**（群 1 つ。lerobot の既定）。
+                         --entry tools/train-entry/train_entry.py が要る。--resume では元の学習と同じ設定を渡す
+  --wandb PROJ:RUN_ID    W&B を online で使う。--network bridge にし、環境変数の許可リストを付ける。
+                         **WANDB_MODE は出さない**（環境変数が CLI より強く、online が黙って落ちる）
+  --detach               切り離して起動する（docker run -d、--rm を付けない、container の中で tee -a、
+                         終了コードを container 自身が <container 名>.rc に書く）。
+                         **container の形が変わる**（環境変数の並び・WANDB_MODE を出さない・mount の並び）。
+                         runner や SSH が死んでも学習とログが続く。--timeout は効かないので拒否する
+  --resume               落ちた所から再開する。--entry が要る（無いと adapter が凍って
+                         学習する parameter が 0 個になる）。出力先が既にあり、
+                         train-output/checkpoints/last があることを要求する。
+                         container 名は <container 名>-resume-<再開元の step> になる。
+                         学習器へ渡すのは --config_path / --resume=true / --peft=null の 3 つだけ
+
+--dpo の既定は action block D（128 module / rank 8 / alpha 8）、batch 32、grad-accum 1、
+50-action chunk、float32、gradient checkpointing、drop-n-last 0、
+warmup=min(200, floor(0.1 * steps))、peak LR 2.5e-5、decay LR 2.5e-6、
+beta 200、lambda 20、steps 1,200。物理 batch × gradient accumulation は
+32×1（既定）、16×2、8×4 だけ（有効 batch は32、各物理 batch は完全な対を含む）。
+beta・lambda・steps 以外の設定は DPO entry の実効値と食い違う指定を拒否する。
+USAGE
+}
+
+# ---- 引数 --------------------------------------------------------------------
+REPO_DIR=$(cd "$TOOL_DIR/.." && pwd)
+ID=""; BLOCKS=""; DATASET=""; BASE=""; OUT_ROOT=""; INVENTORY=""; STAGING=""; REPO_ID=""
+STEPS=800; BATCH=6; GRAD_ACCUM=21; SEED=1000; SAVE_FREQ=200; WARMUP=20
+PEAK_LR=1e-4; DECAY_LR=1e-4; DROP_N_LAST=""; LOG_FREQ=100
+STEPS_GIVEN=false; BATCH_GIVEN=false; GRAD_ACCUM_GIVEN=false; WARMUP_GIVEN=false
+PEAK_LR_GIVEN=false; DECAY_LR_GIVEN=false; DROP_N_LAST_GIVEN=false
+IMAGE=parc2026:latest; TIMEOUT=6h; TIMEOUT_GIVEN=false; CONTAINER_NAME=""; JOB_NAME=""
+LOG_NAME=train.log
+BLOCKS_CONFIG="$TOOL_DIR/train-blocks.tsv"
+TRAINABLE_SCRIPT="$REPO_DIR/scripts/expected_block_trainable.py"
+CHECK_SCRIPT="$REPO_DIR/scripts/check_adapter_modules.sh"
+DRY_RUN=false
+SAVE_CHECKPOINT=""; RANK_ARG=""; ALLOW_LANGUAGE=false
+ALPHA=""; ENTRY=""; ENTRY_DIR=""
+SNAPSHOT_SRC=""; SNAPSHOT_DEST=""
+WANDB_SPEC=""; WANDB_PROJECT=""; WANDB_RUN_ID=""
+DETACH=false; RESUME=false
+EXCLUDE_EPISODES=""; EPISODES_ARG=""; EPISODES_SUMMARY=""
+LR_GROUPS=""; LR_GROUPS_SUMMARY=""
+DPO_MODE=false; DPO_BETA=200; DPO_LAMBDA=20; DPO_STEPS=1200
+DPO_BETA_GIVEN=false; DPO_LAMBDA_GIVEN=false; DPO_STEPS_GIVEN=false
+NETWORK=none
+RESUME_FROM=""          # checkpoints/last が指す step（--resume のとき）
+CONTAINER_BASE_NAME=""  # --resume の接尾辞を付ける前の名前
+LORA_R=""               # --blocks-config の rank 欄から入る（権威は表）
+
+float_equals() {
+  python3 - "$1" "$2" >/dev/null 2>&1 <<'PY'
+import math, sys
+try:
+    got, want = map(float, sys.argv[1:])
+except ValueError:
+    raise SystemExit(1)
+raise SystemExit(0 if math.isfinite(got) and got == want else 1)
+PY
+}
+
+lr_positive_finite() {
+  python3 - "$1" >/dev/null 2>&1 <<'PYEOF'
+import math, sys
+try:
+    v = float(sys.argv[1])
+except ValueError:
+    raise SystemExit(1)
+raise SystemExit(0 if math.isfinite(v) and v > 0 else 1)
+PYEOF
+}
+lr_le() {  # lr_le <a> <b>: a <= b（どちらも lr_positive_finite を通った値）
+  python3 - "$1" "$2" >/dev/null 2>&1 <<'PYEOF'
+import sys
+raise SystemExit(0 if float(sys.argv[1]) <= float(sys.argv[2]) else 1)
+PYEOF
+}
+
+parse_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --id) ID=${2:?}; shift 2 ;;
+      --blocks) BLOCKS=${2:?}; shift 2 ;;
+      --dataset) DATASET=${2:?}; shift 2 ;;
+      --base) BASE=${2:?}; shift 2 ;;
+      --out-root) OUT_ROOT=${2:?}; shift 2 ;;
+      --inventory) INVENTORY=${2:?}; shift 2 ;;
+      --staging) STAGING=${2:?}; shift 2 ;;
+      --repo-id) REPO_ID=${2:?}; shift 2 ;;
+      --steps) STEPS=${2:?}; STEPS_GIVEN=true; shift 2 ;;
+      --batch) BATCH=${2:?}; BATCH_GIVEN=true; shift 2 ;;
+      --grad-accum) GRAD_ACCUM=${2:?}; GRAD_ACCUM_GIVEN=true; shift 2 ;;
+      --seed) SEED=${2:?}; shift 2 ;;
+      --save-freq) SAVE_FREQ=${2:?}; shift 2 ;;
+      --warmup) WARMUP=${2:?}; WARMUP_GIVEN=true; shift 2 ;;
+      --peak-lr) PEAK_LR=${2:?}; PEAK_LR_GIVEN=true; shift 2 ;;
+      --decay-lr) DECAY_LR=${2:?}; DECAY_LR_GIVEN=true; shift 2 ;;
+      --log-freq) LOG_FREQ=${2:?}; shift 2 ;;
+      --drop-n-last) DROP_N_LAST=${2:?}; DROP_N_LAST_GIVEN=true; shift 2 ;;
+      --save-checkpoint) SAVE_CHECKPOINT=${2:?}; shift 2 ;;
+      --rank) RANK_ARG=${2:?}; shift 2 ;;
+      --allow-language-blocks) ALLOW_LANGUAGE=true; shift ;;
+      --alpha) ALPHA=${2:?}; shift 2 ;;
+      --entry) ENTRY=${2:?}; shift 2 ;;
+      --dpo) DPO_MODE=true; shift ;;
+      --dpo-beta) DPO_BETA=${2:?}; DPO_BETA_GIVEN=true; shift 2 ;;
+      --dpo-lambda) DPO_LAMBDA=${2:?}; DPO_LAMBDA_GIVEN=true; shift 2 ;;
+      --dpo-steps) DPO_STEPS=${2:?}; DPO_STEPS_GIVEN=true; shift 2 ;;
+      --snapshot-src) SNAPSHOT_SRC=${2:?}; shift 2 ;;
+      --snapshot-dest) SNAPSHOT_DEST=${2:?}; shift 2 ;;
+      --wandb) WANDB_SPEC=${2:?}; shift 2 ;;
+      --detach) DETACH=true; shift ;;
+      --exclude-episodes) EXCLUDE_EPISODES=${2:?}; shift 2 ;;
+      --lr-groups) LR_GROUPS=${2:?}; shift 2 ;;
+      --resume) RESUME=true; shift ;;
+      --image) IMAGE=${2:?}; shift 2 ;;
+      --timeout) TIMEOUT=${2:?}; TIMEOUT_GIVEN=true; shift 2 ;;
+      --container-name) CONTAINER_NAME=${2:?}; shift 2 ;;
+      --job-name) JOB_NAME=${2:?}; shift 2 ;;
+      --log-name) LOG_NAME=${2:?}; shift 2 ;;
+      --blocks-config) BLOCKS_CONFIG=${2:?}; shift 2 ;;
+      --trainable-script) TRAINABLE_SCRIPT=${2:?}; shift 2 ;;
+      --check-script) CHECK_SCRIPT=${2:?}; shift 2 ;;
+      --dry-run) DRY_RUN=true; shift ;;
+      -h|--help) usage; exit 0 ;;
+      *) usage >&2; die "unknown argument: $1" ;;
+    esac
+  done
+
+  local pair v
+  for pair in "id:$ID" "blocks:$BLOCKS" "dataset:$DATASET" "base:$BASE" "out-root:$OUT_ROOT" \
+              "inventory:$INVENTORY" "staging:$STAGING" "repo-id:$REPO_ID"; do
+    [ -n "${pair#*:}" ] || { usage >&2; die "missing required argument: --${pair%%:*}"; }
+  done
+  case "$ID" in *[!A-Za-z0-9._-]*) die "--id に使えるのは英数字と . _ - だけ: $ID" ;; esac
+  if [ -n "$LR_GROUPS" ] && $DPO_MODE; then
+    die "--lr-groups は --dpo と同時に渡せない（DPO の入口は param group を分けない）"
+  fi
+  if $DPO_MODE; then
+    [ -n "$ENTRY" ] || die "--dpo は --entry dpo_training_entry.py が要る"
+    [ "$(basename -- "$ENTRY")" = dpo_training_entry.py ] \
+      || die "--dpo の --entry は dpo_training_entry.py であること: $ENTRY"
+    [ "$BLOCKS" = D ] || die "--dpo は動作側 block D だけを使う: --blocks D が要る"
+    case "$DPO_STEPS" in ''|*[!0-9]*) die "--dpo-steps は正の整数: $DPO_STEPS" ;; esac
+    [ "${#DPO_STEPS}" -le 9 ] && [ "$DPO_STEPS" -ge 1 ] \
+      || die "--dpo-steps は 1..999999999 の整数: $DPO_STEPS"
+    if $STEPS_GIVEN && [ "$STEPS" != "$DPO_STEPS" ]; then
+      die "--dpo では --steps ($STEPS) と --dpo-steps ($DPO_STEPS) を同じ値にする"
+    fi
+    STEPS=$DPO_STEPS
+    if ! $BATCH_GIVEN && ! $GRAD_ACCUM_GIVEN; then
+      BATCH=32; GRAD_ACCUM=1
+    elif $BATCH_GIVEN && ! $GRAD_ACCUM_GIVEN; then
+      case "$BATCH" in
+        32) GRAD_ACCUM=1 ;;
+        16) GRAD_ACCUM=2 ;;
+        8) GRAD_ACCUM=4 ;;
+        *) die "--dpo の --batch は完全な対を含む 8・16・32 のどれか: $BATCH" ;;
+      esac
+    elif ! $BATCH_GIVEN && $GRAD_ACCUM_GIVEN; then
+      case "$GRAD_ACCUM" in
+        1) BATCH=32 ;;
+        2) BATCH=16 ;;
+        4) BATCH=8 ;;
+        *) die "--dpo の組み合わせは --batch/--grad-accum 32/1・16/2・8/4 のどれか: $GRAD_ACCUM" ;;
+      esac
+    fi
+    case "$BATCH" in ''|*[!0-9]*) die "--dpo の --batch は整数: $BATCH" ;; esac
+    case "$GRAD_ACCUM" in ''|*[!0-9]*) die "--dpo の --grad-accum は整数: $GRAD_ACCUM" ;; esac
+    if [ "$BATCH" -lt 8 ] || [ $((10#$BATCH % 8)) -ne 0 ]; then
+      die "--dpo の --batch は対を分けない 8・16・32 のどれか: $BATCH"
+    fi
+    case "$BATCH:$GRAD_ACCUM" in
+      32:1|16:2|8:4) ;;
+      *) die "--dpo は物理 batch × 勾配蓄積を 32×1・16×2・8×4 に限定: ${BATCH}×${GRAD_ACCUM}" ;;
+    esac
+    local dpo_warmup=$((10#$DPO_STEPS / 10))
+    [ "$dpo_warmup" -le 200 ] || dpo_warmup=200
+    if $WARMUP_GIVEN && [ "$WARMUP" != "$dpo_warmup" ]; then
+      die "--dpo の --warmup は $dpo_warmup に固定"
+    fi
+    WARMUP=$dpo_warmup
+    # 学習率: 既定は 山 2.5e-5・最後 2.5e-6（前回までの DPO の値）。--peak-lr と --decay-lr を両方渡したときだけ、その値を使う
+    # （10-08 DPO の過学習の指示書 3 版。山 1e-4・最後 1e-5。山と最後の比を保つため、片方だけは受け付けない）
+    if $PEAK_LR_GIVEN || $DECAY_LR_GIVEN; then
+      { $PEAK_LR_GIVEN && $DECAY_LR_GIVEN; } || die "--dpo の --peak-lr と --decay-lr は両方渡す（渡さなければ 2.5e-5・2.5e-6）"
+      lr_positive_finite "$PEAK_LR" || die "--dpo の --peak-lr は正の有限値: $PEAK_LR"
+      lr_positive_finite "$DECAY_LR" || die "--dpo の --decay-lr は正の有限値: $DECAY_LR"
+      lr_le "$DECAY_LR" "$PEAK_LR" || die "--dpo の --decay-lr は --peak-lr 以下: $DECAY_LR > $PEAK_LR"
+    else
+      PEAK_LR=2.5e-5
+      DECAY_LR=2.5e-6
+    fi
+    if $DROP_N_LAST_GIVEN && [ "$DROP_N_LAST" != 0 ]; then
+      die "--dpo の --drop-n-last は 0 に固定"
+    fi
+    DROP_N_LAST=0
+    if [ -n "$ALPHA" ] && [ "$ALPHA" != 8 ]; then die "--dpo の --alpha は 8 に固定"; fi
+    ALPHA=${ALPHA:-8}
+  elif $DPO_BETA_GIVEN || $DPO_LAMBDA_GIVEN || $DPO_STEPS_GIVEN; then
+    die "--dpo-beta/--dpo-lambda/--dpo-steps は --dpo と一緒に渡す"
+  fi
+  for pair in "steps:$STEPS" "batch:$BATCH" "grad-accum:$GRAD_ACCUM" "seed:$SEED" \
+              "save-freq:$SAVE_FREQ" "warmup:$WARMUP" "log-freq:$LOG_FREQ"; do
+    v=${pair#*:}
+    case "$v" in ''|*[!0-9]*) die "--${pair%%:*} は整数: $v" ;; esac
+  done
+  # --drop-n-last は既定を持たない。渡さないと欄ごと消え、pi05 の既定 49 で走る。
+  # 抽出元（本選1 の 5090）は 0、Pro6000 は欄を出さない。**どちらなのかを呼ぶ側に必ず書かせる。**
+  [ -n "$DROP_N_LAST" ] || die "--drop-n-last が要る（本選1 の 5090 は 0、Pro6000 は none）。渡さないと pi05 の既定 49 で走る"
+  case "$DROP_N_LAST" in none) ;; *[!0-9]*) die "--drop-n-last は整数か none: $DROP_N_LAST" ;; esac
+  if $DPO_MODE && ! python3 - "$DPO_BETA" "$DPO_LAMBDA" <<'PY'
+import math, sys
+try:
+    beta, lam = map(float, sys.argv[1:])
+except ValueError:
+    raise SystemExit(1)
+raise SystemExit(0 if math.isfinite(beta) and math.isfinite(lam) and beta > 0 and lam >= 0 else 1)
+PY
+  then die "--dpo-beta は正の有限値、--dpo-lambda は 0 以上の有限値が要る"; fi
+  for pair in "rank:$RANK_ARG" "alpha:$ALPHA"; do
+    v=${pair#*:}
+    [ -n "$v" ] || continue
+    case "$v" in *[!0-9]*) die "--${pair%%:*} は整数: $v" ;; esac
+  done
+  case "$LOG_NAME" in ''|*/*) die "--log-name は file 名（/ を含まない）: $LOG_NAME" ;; esac
+  if [ -n "$SAVE_CHECKPOINT" ]; then
+    case "$SAVE_CHECKPOINT" in true|false) ;; *) die "--save-checkpoint は true か false: $SAVE_CHECKPOINT" ;; esac
+  fi
+
+  # --detach は docker run -d で即戻るので timeout(1) が効かない。黙って無視しない
+  if $DETACH && $TIMEOUT_GIVEN; then
+    die "--detach のとき --timeout は効かない（docker run -d は即戻る）。どちらかにする"
+  fi
+  # 片方だけだと、alpha が黙って無視されるか、入口が alpha を読めずその場で落ちる
+  if [ -n "$ALPHA" ] && [ -z "$ENTRY" ]; then
+    die "--alpha は --entry と両方そろっていること（入口の .py が LEROBOT_LORA_ALPHA を読む）"
+  fi
+  if [ -n "$ENTRY" ] && [ -z "$ALPHA" ]; then
+    die "--entry は --alpha と両方そろっていること（入口の .py が LEROBOT_LORA_ALPHA を読む）"
+  fi
+  # 入口が無いと --resume=true --peft=null は adapter を凍らせたまま読み直す（学習する parameter が 0 個）
+  if $RESUME && [ -z "$ENTRY" ]; then
+    die "--resume は --entry が要る（入口の .py が無いと再開で学習する重みが 0 個になる）"
+  fi
+  if { [ -n "$SNAPSHOT_SRC" ] && [ -z "$SNAPSHOT_DEST" ]; } \
+     || { [ -z "$SNAPSHOT_SRC" ] && [ -n "$SNAPSHOT_DEST" ]; }; then
+    die "--snapshot-src と --snapshot-dest は両方渡す"
+  fi
+  if [ -n "$SNAPSHOT_DEST" ]; then
+    case "$SNAPSHOT_DEST" in /*) ;; *) die "--snapshot-dest は絶対パス: $SNAPSHOT_DEST" ;; esac
+  fi
+  # --detach なしの mount の並びには snapshot の行が無い。渡しても黙って mount されず、
+  # dataset の symlink が container の中で切れる
+  if [ -n "$SNAPSHOT_SRC" ] && ! $DETACH; then
+    die "--snapshot-src は --detach のときだけ mount される（--detach なしでは黙って無視されるので止める）"
+  fi
+  if [ -n "$EXCLUDE_EPISODES" ] && [ -z "$ENTRY" ]; then
+    die "--exclude-episodes は --entry が要る（入口の .py が LEROBOT_TRAIN_EPISODES_JSON を読んで sampler を絞る）"
+  fi
+  if [ -n "$EXCLUDE_EPISODES" ] && $RESUME; then
+    die "--exclude-episodes は --resume と同時に渡せない（再開は train_config.json の dataset.episodes を読む）"
+  fi
+  if [ -n "$LR_GROUPS" ]; then
+    [ -n "$ENTRY" ] || die "--lr-groups は --entry が要る（入口の .py が LEROBOT_LR_GROUPS_JSON を読んで param group を分ける）"
+    # 入口が違うと環境変数が黙って無視され、群を分けたつもりで 1 群の学習になる
+    [ "$(basename -- "$ENTRY")" = train_entry.py ] || die "--lr-groups の --entry は train_entry.py であること: $ENTRY"
+  fi
+  if [ -n "$WANDB_SPEC" ]; then
+    case "$WANDB_SPEC" in
+      *:*) WANDB_PROJECT=${WANDB_SPEC%%:*}; WANDB_RUN_ID=${WANDB_SPEC#*:} ;;
+      *) die "--wandb は <project>:<run-id> の形: $WANDB_SPEC" ;;
+    esac
+    [ -n "$WANDB_PROJECT" ] && [ -n "$WANDB_RUN_ID" ] \
+      || die "--wandb は <project>:<run-id> の形: $WANDB_SPEC"
+    # 鍵が無いと通信だけ開いて何も送れない。12 時間枠の立ち上がりを 1 回失う
+    [ -n "${WANDB_API_KEY:-}" ] || die "--wandb を渡したが WANDB_API_KEY が空（.env を読んでから起動する）"
+    # canonical は WANDB_ENTITY が set だと --wandb.entity を 1 行足す。道具は出せないので黙らせない
+    [ -z "${WANDB_ENTITY:-}" ] || die "WANDB_ENTITY が set（この道具は --wandb.entity を出せない。unset で起動する）"
+    NETWORK=bridge
+  fi
+
+  CONTAINER_NAME=${CONTAINER_NAME:-train-$ID}
+  CONTAINER_BASE_NAME=$CONTAINER_NAME
+  JOB_NAME=${JOB_NAME:-$ID-$STEPS}
+}
+
+# ---- 門 ----------------------------------------------------------------------
+# 実際に学習を起動するときだけ効く。--dry-run は docker を起動しないので走行中の編集の事故が起きない
+check_guard() {
+  $DRY_RUN && return 0
+  if [ "${RUN_JOB_GUARD:-}" != "1" ]; then
+    say "STOP: scripts/run_job.sh 経由で起動すること（走行中の編集と、起動したつもりの事故を防ぐため）。引数列だけ見るなら --dry-run"
+    exit 2
+  fi
+}
+
+# ---- BLOCKS（設定ファイルから regex と期待値と rank を引く） -------------------
+REGEX=""; WANT_MODULES=""; WANT_NUMEL=""
+load_blocks() {
+  need_file "$BLOCKS_CONFIG"
+  # rank 欄は行の末尾（5 欄目）。read の変数が 4 個だと regex が rank まで飲む
+  local name modules numel regex rank names=""
+  while IFS=$'\t' read -r name modules numel regex rank; do
+    case "$name" in ''|'#'*) continue ;; esac
+    names="$names${names:+|}$name"
+    if [ "$name" = "$BLOCKS" ]; then
+      REGEX=$regex; WANT_MODULES=$modules; WANT_NUMEL=$numel; LORA_R=$rank
+      break
+    fi
+  done <"$BLOCKS_CONFIG"
+  [ -n "$REGEX" ] || die "BLOCKS は ${names:-（設定が空）} のどれか: $BLOCKS（$BLOCKS_CONFIG）"
+  case "$LORA_R" in
+    ''|*[!0-9]*) die "設定の rank 欄（5 欄目）が整数でない: BLOCKS=$BLOCKS rank='${LORA_R}'（$BLOCKS_CONFIG）" ;;
+  esac
+  # 言語 block は既定では解凍しない（抽出元の安全弁）。明示で通す
+  case "$REGEX" in
+    *language_model*)
+      $ALLOW_LANGUAGE \
+        || die "言語 block が regex に入っている: BLOCKS=$BLOCKS（$BLOCKS_CONFIG）。通すなら --allow-language-blocks"
+      say "ALLOW_LANGUAGE blocks=$BLOCKS（明示で言語 block を通した）"
+      ;;
+  esac
+  # 権威は表。--rank は照合用
+  if [ -n "$RANK_ARG" ] && [ "$RANK_ARG" != "$LORA_R" ]; then
+    die "--rank が設定の rank 欄と違う: --rank=$RANK_ARG 表=$LORA_R（BLOCKS=$BLOCKS $BLOCKS_CONFIG）"
+  fi
+}
+
+# ---- 学習に使わない episode ------------------------------------------------------
+# 一覧の番号を dataset の目録（meta/info.json の total_episodes）から除き、残りを学習器へ渡す。
+# 形・重複・範囲の外の番号は、出力先を作る前に止める
+load_exclude_episodes() {
+  need_file "$EXCLUDE_EPISODES"
+  EXCLUDE_EPISODES=$(realpath -ms -- "$EXCLUDE_EPISODES")
+  local info="$DATASET/meta/info.json" out
+  need_file "$info"
+  out=$(python3 - "$EXCLUDE_EPISODES" "$info" <<'PY'
+import json, sys
+path, info_path = sys.argv[1], sys.argv[2]
+try:
+    payload = json.load(open(path, encoding="utf-8"))
+except (OSError, ValueError) as exc:
+    sys.exit(f"exclude-episodes の json が読めない: {exc}")
+if not isinstance(payload, dict) or not isinstance(payload.get("episodes"), list) or not payload["episodes"]:
+    sys.exit("exclude-episodes に 'episodes' の配列が無いか空")
+ids = []
+for row in payload["episodes"]:
+    if not isinstance(row, dict) or "episode_index" not in row:
+        sys.exit(f"exclude-episodes の行の形が違う: {row!r}")
+    v = row["episode_index"]
+    if isinstance(v, bool) or not isinstance(v, int):
+        sys.exit(f"exclude-episodes の episode_index が整数でない: {row!r}")
+    ids.append(v)
+if len(set(ids)) != len(ids):
+    sys.exit("exclude-episodes に同じ episode_index が 2 回以上ある")
+total = json.load(open(info_path, encoding="utf-8")).get("total_episodes")
+if isinstance(total, bool) or not isinstance(total, int) or total < 1:
+    sys.exit(f"meta/info.json の total_episodes が読めない: {total!r}")
+outside = sorted(i for i in ids if not 0 <= i < total)
+if outside:
+    sys.exit(f"dataset の目録（0..{total - 1}）に無い episode_index が {len(outside)} 件: {outside[:10]}")
+drop = set(ids)
+kept = [i for i in range(total) if i not in drop]
+print(f"{total}\t{len(ids)}\t{len(kept)}")
+print("[" + ",".join(map(str, kept)) + "]")
+PY
+) || die "exclude-episodes が使えない（出力先を作る前に止めた）: $EXCLUDE_EPISODES"
+  EPISODES_SUMMARY=$(printf '%s\n' "$out" | sed -n 1p)
+  EPISODES_ARG=$(printf '%s\n' "$out" | sed -n 2p)
+  local total listed kept
+  IFS=$'\t' read -r total listed kept <<<"$EPISODES_SUMMARY"
+  [ "$kept" -eq $((total - listed)) ] || die "残す episode の数が合わない: total=$total listed=$listed kept=$kept"
+  say "exclude-episodes ok total=$total excluded=$listed kept=$kept（$EXCLUDE_EPISODES）"
+}
+
+# ---- 入力と出力先 --------------------------------------------------------------
+OUT=""
+check_inputs() {
+  need_dir "$DATASET"; need_dir "$BASE"; need_dir "$STAGING"
+  need_file "$INVENTORY"; need_file "$TRAINABLE_SCRIPT"; need_file "$CHECK_SCRIPT"
+  # docker の -v は絶対パスを要る。symlink は解かない（抽出元と同じ文字列を渡す）
+  DATASET=$(realpath -ms -- "$DATASET"); BASE=$(realpath -ms -- "$BASE")
+  STAGING=$(realpath -ms -- "$STAGING"); OUT_ROOT=$(realpath -ms -- "$OUT_ROOT")
+  if [ -n "$ENTRY" ]; then
+    need_file "$ENTRY"
+    ENTRY=$(realpath -ms -- "$ENTRY")
+    ENTRY_DIR=$(dirname -- "$ENTRY")
+  fi
+  if [ -n "$SNAPSHOT_SRC" ]; then
+    need_dir "$SNAPSHOT_SRC"
+    SNAPSHOT_SRC=$(realpath -ms -- "$SNAPSHOT_SRC")
+  fi
+  OUT="$OUT_ROOT/$ID"
+  if [ -n "$EXCLUDE_EPISODES" ]; then load_exclude_episodes; fi
+  if [ -n "$LR_GROUPS" ]; then
+    need_file "$LR_GROUPS"
+    LR_GROUPS=$(realpath -ms -- "$LR_GROUPS")
+    need_file "$ENTRY_DIR/lr_groups.py"
+    # 入口がこの環境変数を読む版であること（古い写しの入口が黙って無視するのを止める）
+    grep -q LEROBOT_LR_GROUPS_JSON "$ENTRY" || die "この入口は --lr-groups に対応していない（LEROBOT_LR_GROUPS_JSON を読まない）: $ENTRY"
+  fi
+  if $RESUME; then
+    # 新規起動の「既にあれば止まる」と逆。再開は出力先が既にあることを要求する
+    need_dir "$OUT"
+    local last="$OUT/train-output/checkpoints/last"
+    # 無い場合と、在るが symlink でない場合を分ける。実体 dir を通すと readlink が空になり
+    # container の名前が -resume-last になる（step が名前に残らない）
+    [ -e "$last" ] || [ -L "$last" ] || die "再開先の checkpoints/last が無い: $last"
+    [ -L "$last" ] || die "再開先の checkpoints/last が symlink でない: $last"
+    RESUME_FROM=$(basename -- "$(readlink -- "$last")")
+    [ -n "$RESUME_FROM" ] || die "checkpoints/last が指す step が読めない: $last"
+    # 終了コードの file は消さない決まりなので、同じ名前で 2 回目を起動すると必ず拒否される
+    CONTAINER_NAME="$CONTAINER_BASE_NAME-resume-$RESUME_FROM"
+    say "RESUME_FROM step=$RESUME_FROM container=$CONTAINER_NAME"
+    # 再開の optimizer は、元の学習と同じ群の分け方でないと読めない（群の数が違えば落ち、同じ数で割り当てが違えば黙って狂う）。
+    # 元の学習が群を分けたかは、出力先に設定の写し（lr-groups.json）があるかで決まる
+    if [ -f "$OUT/lr-groups.json" ]; then
+      [ -n "$LR_GROUPS" ] || die "元の学習は学習率の群を分けた（$OUT/lr-groups.json がある）。再開にも同じ --lr-groups が要る"
+      cmp -s -- "$LR_GROUPS" "$OUT/lr-groups.json" \
+        || die "--lr-groups が元の学習の設定（$OUT/lr-groups.json）と違う: $LR_GROUPS"
+    else
+      [ -z "$LR_GROUPS" ] || die "元の学習は学習率の群を分けていない（$OUT/lr-groups.json が無い）。再開に --lr-groups は渡せない"
+    fi
+  else
+    ensure_absent "$OUT"
+  fi
+}
+
+# ---- 終了コードの file（--detach のときだけ書かれる。消さない） ------------------
+# docker には訊かない。rc file だけを読む（--dry-run でも同じ判定が要るため）
+record_container_exit() {  # <container 名> <rc> <出所>
+  local tsv="$OUT/container-exits.tsv"
+  [ -f "$tsv" ] || printf 'container\trc\tsource\n' >"$tsv"
+  awk -F'\t' -v n="$1" '$1 == n { f = 1 } END { exit !f }' "$tsv" && return 0
+  printf '%s\t%s\t%s\n' "$1" "$2" "$3" >>"$tsv"
+}
+collect_container_exits() {
+  [ -f "$OUT/containers.tsv" ] || return 0
+  local name rest rc
+  while IFS=$'\t' read -r name rest; do
+    [ -n "$name" ] || continue
+    if [ -f "$OUT/container-exits.tsv" ] \
+       && awk -F'\t' -v n="$name" '$1 == n { f = 1 } END { exit !f }' "$OUT/container-exits.tsv"; then
+      continue
+    fi
+    if [ -s "$OUT/$name.rc" ]; then
+      rc=$(head -n 1 "$OUT/$name.rc")
+      case "$rc" in ''|*[!0-9]*) rc=125 ;; esac
+      record_container_exit "$name" "$rc" rc-file
+    elif container_is_running "$name"; then
+      # **まだ走っている。**--detach は「runner は死んで container は生きる」状態を意図的に作るので、
+      # その上に 2 本目を起動すると同じ出力先を 2 つの学習が書く。missing で確定もさせない（後から
+      # 本当の終了コードが来ても上書きしない作りなので、1 度書くと永久に嘘が残る）
+      die "container がまだ走っている: $name（終わるのを待つか docker kill してから回収する）"
+    else
+      record_container_exit "$name" "" missing
+    fi
+  done <"$OUT/containers.tsv"
+  say "COLLECTED $(( $(grep -c '' "$OUT/container-exits.tsv" 2>/dev/null || echo 1) - 1 ))"
+}
+# 走行中かを docker に訊く。--dry-run では呼ばない（偽 docker でも本物でも同じ判定にならないため）
+container_is_running() {  # <container 名>
+  [ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null || printf false)" = true ]
+}
+check_container_rc() {
+  [ -n "$OUT" ] || return 0
+  $DRY_RUN || collect_container_exits
+  # 終了コードの file は container 名ごとに 1 つで、消さない。**回収済みなら通す。**
+  # 回収しても止まり続けると、起動直後に落ちた再開が同じ step から二度と再開できない
+  if [ -e "$OUT/$CONTAINER_NAME.rc" ]; then
+    if [ -f "$OUT/container-exits.tsv" ] \
+       && awk -F'\t' -v n="$CONTAINER_NAME" '$1 == n { f = 1 } END { exit !f }' "$OUT/container-exits.tsv"; then
+      say "RC_ALREADY_COLLECTED $CONTAINER_NAME（file は残すが回収済みなので通す）"
+    else
+      die "未回収の終了コードの file が残っている: $OUT/$CONTAINER_NAME.rc（回収してから起動する）"
+    fi
+  fi
+  return 0
+}
+
+# 解凍対象の数を、学習前に inventory で確かめる（走らせてから食い違いに気付かないため）
+# 再開でも adapter の形は変わらないので通す
+GOT_NUMEL=""; GOT_MATCHED=""
+check_numel() {
+  local out
+  out=$(python3 "$TRAINABLE_SCRIPT" "$INVENTORY" "$BLOCKS" "$REGEX" "$LORA_R") \
+    || die "expected_block_trainable.py が落ちた: $TRAINABLE_SCRIPT"
+  GOT_NUMEL=$(printf '%s\n' "$out" | awk -F'\t' '$1 == "TRAINABLE_NUMEL" { print $2 }')
+  GOT_MATCHED=$(printf '%s\n' "$out" | awk -F'\t' '$1 == "MATCHED_LINEAR" { print $2 }')
+  [ "$GOT_NUMEL" = "$WANT_NUMEL" ] \
+    || die "numel が違う got=${GOT_NUMEL:-none} want=$WANT_NUMEL（BLOCKS=$BLOCKS inventory=$INVENTORY rank=$LORA_R）"
+  say "numel ok blocks=$BLOCKS rank=$LORA_R numel=$GOT_NUMEL matched_linear=$GOT_MATCHED"
+}
+
+# 学習率の群を、学習の前に inventory で照合する（起動してから食い違いに気付かないため）
+load_lr_groups() {
+  LR_GROUPS_SUMMARY=$(python3 "$ENTRY_DIR/lr_groups.py" --spec "$LR_GROUPS" --inventory "$INVENTORY" --rank "$LORA_R" \
+    --block-regex "$REGEX" --block-numel "$WANT_NUMEL" --peak-lr "$PEAK_LR" 2>&1) \
+    || die "lr-groups が使えない（出力先を作る前に止めた）: $LR_GROUPS: $LR_GROUPS_SUMMARY"
+  say "$LR_GROUPS_SUMMARY（$LR_GROUPS）"
+}
+
+# ---- container の引数列 --------------------------------------------------------
+# --detach を渡さなければ抽出元と同じ 53 + 29 行。順も同じ。
+# --detach を渡すと Pro6000 の形になる（環境変数の並び・mount の並び・入口の包み）
+DOCKER_ARGS=()
+PROGRAM_ARGV=()
+TRAIN_ARGS=()
+build_argv() {
+  local home=/tmp/h
+  if [ -n "$ENTRY" ]; then home=/tmp/home; fi
+
+  local -a pre=(run)
+  if $DETACH; then
+    # --rm を付けない。終了コードを読み終わるまで container を残す
+    pre+=(-d --name "$CONTAINER_NAME")
+  else
+    pre+=(--rm --name "$CONTAINER_NAME")
+  fi
+  pre+=(--gpus all --user "$(host_uid):$(host_gid)" --network "$NETWORK" --shm-size=16g
+        --read-only --tmpfs /tmp:rw,exec,size=8g)
+
+  local -a envs=(
+    -e "HOME=$home" -e PYTHONDONTWRITEBYTECODE=1 -e PYTHONPATH=/staging/lerobot/src
+    -e HF_HOME=/staging/data/hf -e HF_HUB_CACHE=/staging/data/hf/hub
+    -e HF_DATASETS_CACHE=/tmp/hf-datasets
+  )
+  if [ -n "$ENTRY" ]; then envs+=(-e HF_LEROBOT_HOME=/tmp/lerobot-home); fi
+  if $DETACH; then
+    envs+=(-e TOKENIZERS_PARALLELISM=false -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1)
+  else
+    envs+=(-e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e TOKENIZERS_PARALLELISM=false)
+  fi
+  envs+=(-e "LEROBOT_GRAD_ACCUM=$GRAD_ACCUM")
+  if [ -n "$ALPHA" ]; then envs+=(-e "LEROBOT_LORA_ALPHA=$ALPHA"); fi
+  if [ -n "$EPISODES_ARG" ]; then envs+=(-e LEROBOT_TRAIN_EPISODES_JSON=/run/episodes-used.json); fi
+  if [ -n "$LR_GROUPS" ]; then envs+=(-e LEROBOT_LR_GROUPS_JSON=/run/lr-groups.json); fi
+  if $DETACH; then
+    envs+=(-e "RUN_LOG=/run/$LOG_NAME" -e "RUN_RC=/run/$CONTAINER_NAME.rc")
+  fi
+  if [ -n "$WANDB_SPEC" ]; then
+    # 許可リスト: metric 行とハイパラだけ。console も host の情報も pip freeze も code も上げない。
+    # **WANDB_MODE は出さない。**環境変数が CLI より強く、online が黙って落ちる
+    envs+=(
+      -e WANDB_API_KEY -e WANDB_SILENT=true -e WANDB_CONSOLE=off
+      -e WANDB_DISABLE_CODE=true -e WANDB_DISABLE_GIT=true
+      -e WANDB_X_DISABLE_META=true -e WANDB_X_DISABLE_STATS=true
+      -e WANDB_X_DISABLE_MACHINE_INFO=true -e WANDB_X_SAVE_REQUIREMENTS=false
+    )
+  elif ! $DETACH; then
+    envs+=(-e WANDB_MODE=offline -e WANDB_SILENT=true)
+  fi
+
+  local -a mounts=(
+    -v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro
+    -v "$STAGING/lerobot:/staging/lerobot:ro" -v "$STAGING/data/hf:/staging/data/hf:ro"
+  )
+  if $DETACH; then
+    mounts+=(-v "$DATASET:/staging/dataset:ro")
+    if [ -n "$SNAPSHOT_SRC" ]; then mounts+=(-v "$SNAPSHOT_SRC:$SNAPSHOT_DEST:ro"); fi
+    mounts+=(-v "$BASE:/base:ro")
+    if [ -n "$ENTRY" ]; then mounts+=(-v "$ENTRY_DIR:/runtime:ro"); fi
+  else
+    mounts+=(-v "$BASE:/base:ro" -v "$DATASET:/staging/dataset:ro")
+  fi
+  mounts+=(-v "$OUT:/run:rw")
+
+  if [ -n "$ENTRY" ]; then
+    PROGRAM_ARGV=(/staging/lerobot/.venv/bin/python "/runtime/$(basename -- "$ENTRY")")
+  else
+    PROGRAM_ARGV=(/staging/lerobot/.venv/bin/lerobot-train)
+  fi
+
+  build_train_args
+
+  DOCKER_ARGS=("${pre[@]}" "${envs[@]}" "${mounts[@]}" "$IMAGE")
+  if $DETACH; then
+    # container の中で tee -a する（追記。再開のたびに前のログを消さない）。
+    # 終了コードは container 自身が file に書く。runner が死んだ後はこれだけが残る記録になる
+    local wrapper
+    wrapper=$(printf 'set -o pipefail; %s "$@" 2>&1 | tee -a "$RUN_LOG"; rc=$?; printf "%%s\\n" "$rc" >"$RUN_RC"; exit "$rc"' \
+      "${PROGRAM_ARGV[*]}")
+    DOCKER_ARGS+=(bash -c "$wrapper" bash)
+  else
+    DOCKER_ARGS+=("${PROGRAM_ARGV[@]}")
+  fi
+  DOCKER_ARGS+=("${TRAIN_ARGS[@]}")
+}
+
+build_train_args() {
+  if $RESUME; then
+    # 再開の起動そのものは引数 3 つ。--peft=null が無いと adapter が二重に包まれる（2026-09-01 の記録）。
+    # LEROBOT_GRAD_ACCUM は train_config.json に入らないので環境変数として渡し直している
+    TRAIN_ARGS=(
+      --config_path=/run/train-output/checkpoints/last/pretrained_model/train_config.json
+      --resume=true
+      --peft=null
+    )
+    if $DPO_MODE; then
+      TRAIN_ARGS+=("--dpo-beta=$DPO_BETA" "--dpo-lambda=$DPO_LAMBDA" "--dpo-steps=$DPO_STEPS")
+    fi
+    return 0
+  fi
+  local action_steps=10 policy_dtype=bfloat16
+  if $DPO_MODE; then action_steps=50; policy_dtype=float32; fi
+  TRAIN_ARGS=(
+    --policy.type=pi05 --policy.pretrained_path=/base "--policy.dtype=$policy_dtype"
+    --policy.n_obs_steps=1 "--policy.n_action_steps=$action_steps" "--policy.optimizer_lr=$PEAK_LR"
+    "--policy.scheduler_warmup_steps=$WARMUP" "--policy.scheduler_decay_steps=$STEPS"
+    "--policy.scheduler_decay_lr=$DECAY_LR"
+    --policy.num_inference_steps=10 --policy.device=cuda --policy.push_to_hub=false
+  )
+  if $DPO_MODE; then TRAIN_ARGS+=(--policy.chunk_size=50 --policy.gradient_checkpointing=true); fi
+  if [ "$DROP_N_LAST" != none ]; then TRAIN_ARGS+=("--policy.drop_n_last_frames=$DROP_N_LAST"); fi
+  TRAIN_ARGS+=(
+    --peft.method_type=LORA "--peft.r=$LORA_R" "--peft.target_modules=$REGEX"
+    "--dataset.repo_id=$REPO_ID" --dataset.root=/staging/dataset --dataset.video_backend=pyav
+  )
+  TRAIN_ARGS+=(
+    "--batch_size=$BATCH" "--steps=$STEPS" --num_workers=8
+  )
+  if [ -n "$SAVE_CHECKPOINT" ]; then TRAIN_ARGS+=("--save_checkpoint=$SAVE_CHECKPOINT"); fi
+  TRAIN_ARGS+=(
+    "--save_freq=$SAVE_FREQ" "--log_freq=$LOG_FREQ"
+    --output_dir=/run/train-output "--job_name=$JOB_NAME"
+    "--seed=$SEED"
+  )
+  if $DPO_MODE; then
+    TRAIN_ARGS+=("--dpo-beta=$DPO_BETA" "--dpo-lambda=$DPO_LAMBDA" "--dpo-steps=$DPO_STEPS")
+  fi
+  if [ -n "$WANDB_SPEC" ]; then
+    TRAIN_ARGS+=(
+      --wandb.enable=true "--wandb.project=$WANDB_PROJECT" "--wandb.run_id=$WANDB_RUN_ID"
+      --wandb.mode=online --wandb.disable_artifact=true
+    )
+  else
+    TRAIN_ARGS+=(--wandb.enable=false)
+  fi
+}
+
+# ---- 記録 --------------------------------------------------------------------
+# arm.log の行の形は抽出元と同じ（[HH:MM:SS] TRAIN_START ...）。runner の --proof がこれを見る
+note() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >>"$OUT/arm.log"; say "$*"; }
+
+write_manifest() {
+  local sha_tool sha_lib sha_blocks sha_inv sha_trainable sha_check name
+  sha_tool=$(sha256_file "$TOOL_DIR/train"); sha_lib=$(sha256_file "$TOOL_DIR/lib/common.sh")
+  sha_blocks=$(sha256_file "$BLOCKS_CONFIG"); sha_inv=$(sha256_file "$INVENTORY")
+  sha_trainable=$(sha256_file "$TRAINABLE_SCRIPT"); sha_check=$(sha256_file "$CHECK_SCRIPT")
+  # 期待値は取らない。照合していないことを言ってから通す（観測値は manifest に残る）
+  check_sha256 trainable-script "$sha_trainable" ""
+  check_sha256 check-script "$sha_check" ""
+  # 再開は manifest.json を上書きせず、1 回ごとに足す
+  if $RESUME; then name="manifest-resume-$RESUME_FROM.json"; else name="manifest.json"; fi
+  M_PATH="$OUT/$name" M_ID="$ID" M_BLOCKS="$BLOCKS" M_REGEX="$REGEX" \
+  M_WANT_MODULES="$WANT_MODULES" M_WANT_NUMEL="$WANT_NUMEL" M_GOT_MATCHED="$GOT_MATCHED" \
+  M_DATASET="$DATASET" M_BASE="$BASE" M_OUT_ROOT="$OUT_ROOT" M_INVENTORY="$INVENTORY" \
+  M_STAGING="$STAGING" M_REPO_ID="$REPO_ID" M_STEPS="$STEPS" M_BATCH="$BATCH" \
+  M_GRAD_ACCUM="$GRAD_ACCUM" M_SEED="$SEED" M_SAVE_FREQ="$SAVE_FREQ" M_WARMUP="$WARMUP" \
+  M_PEAK_LR="$PEAK_LR" M_DECAY_LR="$DECAY_LR" M_DROP_N_LAST="$DROP_N_LAST" M_IMAGE="$IMAGE" \
+  M_TIMEOUT="$TIMEOUT" M_CONTAINER_NAME="$CONTAINER_NAME" M_JOB_NAME="$JOB_NAME" \
+  M_BLOCKS_CONFIG="$BLOCKS_CONFIG" M_TRAINABLE="$TRAINABLE_SCRIPT" M_CHECK="$CHECK_SCRIPT" \
+  M_LOG_FREQ="$LOG_FREQ" M_SAVE_CHECKPOINT="$SAVE_CHECKPOINT" M_RANK="$LORA_R" \
+  M_ALPHA="$ALPHA" M_ENTRY="$ENTRY" M_SNAPSHOT_SRC="$SNAPSHOT_SRC" M_SNAPSHOT_DEST="$SNAPSHOT_DEST" \
+  M_WANDB="$WANDB_SPEC" M_NETWORK="$NETWORK" M_LOG_NAME="$LOG_NAME" \
+  M_EXCLUDE_EPISODES="$EXCLUDE_EPISODES" M_EPISODES_SUMMARY="$EPISODES_SUMMARY" \
+  M_SHA_EXCLUDE="$([ -n "$EXCLUDE_EPISODES" ] && sha256_file "$EXCLUDE_EPISODES" || true)" \
+  M_LR_GROUPS="$LR_GROUPS" M_LR_GROUPS_SUMMARY="$LR_GROUPS_SUMMARY" \
+  M_SHA_LR_GROUPS="$([ -n "$LR_GROUPS" ] && sha256_file "$LR_GROUPS" || true)" \
+  M_DETACH="$($DETACH && echo true || echo false)" M_RESUME="$($RESUME && echo true || echo false)" \
+  M_RESUME_FROM="$RESUME_FROM" M_ALLOW_LANGUAGE="$($ALLOW_LANGUAGE && echo true || echo false)" \
+  M_DPO_MODE="$($DPO_MODE && echo true || echo false)" M_DPO_BETA="$DPO_BETA" \
+  M_DPO_LAMBDA="$DPO_LAMBDA" M_DPO_STEPS="$DPO_STEPS" \
+  M_SHA_TOOL="$sha_tool" M_SHA_LIB="$sha_lib" M_SHA_BLOCKS="$sha_blocks" M_SHA_INV="$sha_inv" \
+  M_SHA_TRAINABLE="$sha_trainable" M_SHA_CHECK="$sha_check" \
+  python3 - "${DOCKER_ARGS[@]}" <<'PY'
+import datetime, json, os, platform, sys
+e = os.environ
+m = {
+  "tool": "tools/train",
+  "id": e["M_ID"],
+  "written_at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+  "host": {"node": platform.node(), "kernel": platform.release()},
+  "args": {k: e["M_" + v] for k, v in [
+    ("--id", "ID"), ("--blocks", "BLOCKS"), ("--dataset", "DATASET"), ("--base", "BASE"),
+    ("--out-root", "OUT_ROOT"), ("--inventory", "INVENTORY"), ("--staging", "STAGING"),
+    ("--repo-id", "REPO_ID"), ("--steps", "STEPS"), ("--batch", "BATCH"),
+    ("--grad-accum", "GRAD_ACCUM"), ("--seed", "SEED"), ("--save-freq", "SAVE_FREQ"),
+    ("--warmup", "WARMUP"), ("--peak-lr", "PEAK_LR"), ("--decay-lr", "DECAY_LR"),
+    ("--drop-n-last", "DROP_N_LAST"), ("--image", "IMAGE"), ("--timeout", "TIMEOUT"),
+    ("--container-name", "CONTAINER_NAME"), ("--job-name", "JOB_NAME"),
+    ("--blocks-config", "BLOCKS_CONFIG"), ("--trainable-script", "TRAINABLE"),
+    ("--check-script", "CHECK"), ("--log-freq", "LOG_FREQ"),
+    ("--save-checkpoint", "SAVE_CHECKPOINT"), ("--rank", "RANK"), ("--alpha", "ALPHA"),
+    ("--entry", "ENTRY"), ("--snapshot-src", "SNAPSHOT_SRC"),
+    ("--snapshot-dest", "SNAPSHOT_DEST"), ("--wandb", "WANDB"), ("--log-name", "LOG_NAME"),
+    ("--detach", "DETACH"), ("--resume", "RESUME"),
+    ("--allow-language-blocks", "ALLOW_LANGUAGE"), ("--exclude-episodes", "EXCLUDE_EPISODES")]},
+  "blocks": {"name": e["M_BLOCKS"], "regex": e["M_REGEX"], "rank": int(e["M_RANK"]),
+             "want_modules": int(e["M_WANT_MODULES"]), "want_numel": int(e["M_WANT_NUMEL"]),
+             "inventory_matched_linear": int(e["M_GOT_MATCHED"])},
+  "container": {"name": e["M_CONTAINER_NAME"], "network": e["M_NETWORK"],
+                "detached": e["M_DETACH"] == "true", "log_name": e["M_LOG_NAME"],
+                "resume_from": e["M_RESUME_FROM"] or None},
+  "inputs_sha256": {
+    "inventory": e["M_SHA_INV"], "blocks_config": e["M_SHA_BLOCKS"],
+    "trainable_script": e["M_SHA_TRAINABLE"], "check_script": e["M_SHA_CHECK"],
+  },
+  "tool_files_sha256": {"tools/train": e["M_SHA_TOOL"], "tools/lib/common.sh": e["M_SHA_LIB"]},
+  "episodes": (dict(zip(("total", "excluded", "kept"), map(int, e["M_EPISODES_SUMMARY"].split("\t"))),
+                    exclude_list=e["M_EXCLUDE_EPISODES"], exclude_list_sha256=e["M_SHA_EXCLUDE"],
+                    kept_list="episodes-used.json")
+               if e["M_EPISODES_SUMMARY"] else None),
+  "docker_argv": sys.argv[1:],
+  "note": "所要時間は arm.log の TRAIN_START と TRAIN_DONE の時刻。呼ぶ 2 本の sha は照合していない（観測値のみ）",
+}
+if e["M_LR_GROUPS"]:  # 渡したときだけ欄を足す（渡さない学習の manifest は今までと同じ形）
+    m["args"]["--lr-groups"] = e["M_LR_GROUPS"]
+    m["lr_groups"] = {"spec": e["M_LR_GROUPS"], "spec_sha256": e["M_SHA_LR_GROUPS"], "copy": "lr-groups.json",
+                      "host_check": e["M_LR_GROUPS_SUMMARY"] or None}
+if e["M_DPO_MODE"] == "true":
+    m["dpo"] = {
+        "enabled": True,
+        "beta": float(e["M_DPO_BETA"]),
+        "lambda": float(e["M_DPO_LAMBDA"]),
+        "steps": int(e["M_DPO_STEPS"]),
+        "action_chunk": 50,
+        "physical_batch_size": int(e["M_BATCH"]),
+        "gradient_accumulation": int(e["M_GRAD_ACCUM"]),
+        "effective_batch_size": int(e["M_BATCH"]) * int(e["M_GRAD_ACCUM"]),
+        "dtype": "float32",
+        "gradient_checkpointing": True,
+    }
+with open(e["M_PATH"], "x", encoding="utf-8") as fh:
+    json.dump(m, fh, ensure_ascii=False, indent=2)
+    fh.write("\n")
+PY
+  if $RESUME; then need_file "$OUT/manifest-resume-$RESUME_FROM.json"; else need_file "$OUT/manifest.json"; fi
+}
+
+# ---- 学習と事後検査 ------------------------------------------------------------
+# 切り離して起動する。docker run -d は即戻るので timeout(1) は使えない。
+# 終了コードは docker wait から取り、取れなければ container 自身が書いた file から読む
+run_detached() {
+  local rcfile="$OUT/$CONTAINER_NAME.rc" waited rc src
+  # 起動の直前に書く。runner が死んでも「何を起動したか」だけは残る
+  printf '%s\t%s\t%s\n' "$CONTAINER_NAME" "$(date -u +%FT%TZ)" "$NETWORK" >>"$OUT/containers.tsv"
+  docker "${DOCKER_ARGS[@]}" >/dev/null || { note "TRAIN_FAIL docker run -d が落ちた"; exit 1; }
+  set +e
+  waited=$(docker wait "$CONTAINER_NAME" 2>/dev/null)
+  set -e
+  case "$waited" in
+    ''|*[!0-9]*) rc=$(head -n 1 "$rcfile" 2>/dev/null || true); src=rc-file ;;
+    *) rc=$waited; src=docker ;;
+  esac
+  case "$rc" in ''|*[!0-9]*) rc=125 ;; esac
+  record_container_exit "$CONTAINER_NAME" "$rc" "$src"
+  docker rm "$CONTAINER_NAME" >/dev/null 2>&1 || true
+  say "CONTAINER_RC name=$CONTAINER_NAME rc=$rc source=$src"
+  return "$rc"
+}
+
+launch() {
+  mkdir -p "$OUT"
+  if [ -n "$EPISODES_ARG" ]; then printf '%s\n' "$EPISODES_ARG" >"$OUT/episodes-used.json"; fi
+  # 設定の写しを出力先に置く。container が読むのは元の file でなくこの写し（何を使ったかが出力先に残る。再開の照合にも使う）
+  if [ -n "$LR_GROUPS" ] && ! $RESUME; then
+    cp -- "$LR_GROUPS" "$OUT/lr-groups.json"
+    cmp -s -- "$LR_GROUPS" "$OUT/lr-groups.json" || { note "TRAIN_FAIL lr-groups.json の写しが元と違う"; exit 1; }
+  fi
+  write_manifest
+  note "TRAIN_START arm=$ID blocks=$BLOCKS modules=$WANT_MODULES numel=$WANT_NUMEL"
+  if $RESUME; then
+    # 再開は step も学習率も batch も train_config.json から読む。ここで書けるのは環境変数で渡す分だけ
+    note "RESUME from=$RESUME_FROM container=$CONTAINER_NAME GA=$GRAD_ACCUM base=$(basename "$BASE")（step・学習率・batch は train_config.json から読む）"
+  else
+    note "steps=$STEPS bs${BATCH}xGA$GRAD_ACCUM save_freq=$SAVE_FREQ peak=$PEAK_LR decay_lr=$DECAY_LR seed=$SEED base=$(basename "$BASE")"
+  fi
+  if $DPO_MODE; then
+    note "DPO_LAUNCH beta=$DPO_BETA lambda=$DPO_LAMBDA steps=$DPO_STEPS chunk=50 block=$BLOCKS alpha=$ALPHA"
+  fi
+
+  local rc=0
+  set +e
+  if $DETACH; then
+    run_detached
+    rc=$?
+  else
+    timeout --foreground --signal=TERM --kill-after=60s "$TIMEOUT" \
+      docker "${DOCKER_ARGS[@]}" >>"$OUT/$LOG_NAME" 2>&1   # 追記。> だと再開のたびに前のログが消える
+    rc=$?
+  fi
+  set -e
+  if [ "$rc" -ne 0 ]; then
+    tail -60 "$OUT/$LOG_NAME" >&2 || true
+    note "TRAIN_FAIL rc=$rc"; exit 1
+  fi
+
+  # 学習後に adapter を数える。「走った」ことではなく「狙った module が動いた」ことを見る。
+  # 検査 script は自分の path（RUN_JOB_SCRIPT があればそれ）から repo を辿るので、この道具を指したまま
+  # 渡さない（tools/stage が gripper 検査でしているのと同じ）
+  if ! env -u RUN_JOB_SCRIPT "$CHECK_SCRIPT" "$OUT/train-output/checkpoints" "$WANT_MODULES" 2>&1 \
+       | grep -E '^(OK|NG)|ADAPTER_CHECK' | tee -a "$OUT/arm.log" | grep -q 'ADAPTER_CHECK=PASS'; then
+    note "TRAIN_FAIL adapter の module 数が合わない（arm.log を見る）"; exit 1
+  fi
+  note "TRAIN_DONE arm=$ID rc=0"
+}
+
+# ---- 本体 --------------------------------------------------------------------
+parse_args "$@"
+check_guard
+load_blocks
+if $DPO_MODE && { [ "$LORA_R" != 8 ] || [ "$WANT_MODULES" != 128 ] || [ "$WANT_NUMEL" != 3482112 ]; }; then
+  die "--dpo は既存 action block D（128 module / rank 8 / numel 3,482,112）を使う"
+fi
+check_inputs
+check_container_rc
+check_numel
+if [ -n "$LR_GROUPS" ]; then load_lr_groups; fi
+build_argv
+if $DRY_RUN; then
+  printf '%s\n' "${DOCKER_ARGS[@]}"
+  say "DRY_RUN id=$ID args=${#DOCKER_ARGS[@]}（docker は起動していない。出力先も作っていない）"
+  exit 0
+fi
+launch

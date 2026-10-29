@@ -1,0 +1,26 @@
+# 課題集合 t3-verbswap-put（src/make_verbswap_sets.py が書く）。列は ops/data/eval-local-sets.tsv と同じ
+t3-verbswap-put	select	=1	=0	ds2learned-k1p-dir-0303-v1
+t3-verbswap-put	select	=1	=0	ds2learned-k1p-dir-0311-v1
+t3-verbswap-put	select	=1	=0	ds2learned-k1p-dir-0321-v1
+t3-verbswap-put	select	=1	=0	ds2learned-k1p-dir-sw-0307-v1
+t3-verbswap-put	select	=1	=0	ds2learned-k1p-dir-sw-0316-v1
+t3-verbswap-put	select	=1	=0	ds2learned-k1p-dir-sw-0318-v1
+t3-verbswap-put	select	=1	=0	ds2learned-k1p-loc-0326-v1
+t3-verbswap-put	select	=1	=0	ds2learned-k1p-loc-0327-v1
+t3-verbswap-put	select	=1	=0	ds2learned-k1p-loc-0328-v1
+t3-verbswap-put	select	=1	=0	ds2learned-k1p-loc-0334-v1
+t3-verbswap-put	select	=1	=0	ds2learned-k1p-loc-sw-0302-v1
+t3-verbswap-put	select	=1	=0	ds2learned-k1p-loc-sw-0333-v1
+t3-verbswap-put	select	=1	=0	ds2learned-lr4-dir-0305-v1
+t3-verbswap-put	select	=1	=0	ds2learned-lr4-dir-0309-v1
+t3-verbswap-put	select	=1	=0	ds2learned-lr4-dir-0323-v1
+t3-verbswap-put	select	=1	=0	ds2learned-lr4-dir-0326-v1
+t3-verbswap-put	select	=1	=0	ds2learned-lr4-loc-0312-v1
+t3-verbswap-put	select	=1	=0	ds2learned-lr4-loc-0314-v1
+t3-verbswap-put	select	=1	=0	ds2learned-lr4-loc-0322-v1
+t3-verbswap-put	select	=1	=0	ds2learned-lr4-loc-0323-v1
+t3-verbswap-put	select	=1	=0	ds2learned-lr4-loc-0329-v1
+t3-verbswap-put	select	=1	=0	ds2learned-lr4-loc-0335-v1
+t3-verbswap-put	select	=1	=0	ds2learned-lr4-loc-0336-v1
+t3-verbswap-put	select	=1	=0	ds2learned-lr4-loc-0338-v1
+t3-verbswap-put	select	=1	=0	ds2learned-lr4-loc-0339-v1

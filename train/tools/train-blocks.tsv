@@ -1,0 +1,17 @@
+# tools/train の BLOCKS。1 行 = 1 組。列はタブ区切り: 名前 / 期待 module 数 / 期待 numel / regex / rank
+#
+# regex は --peft.target_modules にそのまま渡り、起動前に expected_block_trainable.py で
+# inventory と突き合わせる（numel が違えば学習の前に止まる）。module 数は学習後の adapter 検査に渡る。
+# **rank の欄は行の末尾（5 欄目）。**numel は rank ごとに変わるので、両方を同じ行で持つ。
+# --rank は照合用で、権威はこの表。違えば起動前に止まる。
+# 言語 block（language_model）を含む regex は既定では道具が止める（--allow-language-blocks で通す）。
+# VD は D と V を ( | ) で合成したもの。
+# VMDLmL は Pro6000 の canonical（416 module / rank 16）。regex は
+# artifacts/pro6000-canonical-lang-0915/evidence/target-regex-416.json の union_target_regex、
+# 期待値は同 evidence/expected-416.tsv（MATCHED_LINEAR / TRAINABLE_NUMEL）。どちらも新しく計算していない。
+D	128	3482112	(.*\.gemma_expert\..*\.self_attn\.(q|k|v|o)_proj|.*\.gemma_expert\..*\.mlp\.(gate|up|down)_proj|model\.(action_in_proj|action_out_proj))	8
+V	162	4347648	model\.paligemma_with_expert\.paligemma\.model\.vision_tower\.vision_model\.encoder\.layers\.[0-9]+\.(self_attn\.(q|k|v|out)_proj|mlp\.(fc1|fc2))	8
+VA	108	1990656	model\.paligemma_with_expert\.paligemma\.model\.vision_tower\.vision_model\.encoder\.layers\.[0-9]+\.self_attn\.(q|k|v|out)_proj	8
+VD	290	7829760	((.*\.gemma_expert\..*\.self_attn\.(q|k|v|o)_proj|.*\.gemma_expert\..*\.mlp\.(gate|up|down)_proj|model\.(action_in_proj|action_out_proj))|model\.paligemma_with_expert\.paligemma\.model\.vision_tower\.vision_model\.encoder\.layers\.[0-9]+\.(self_attn\.(q|k|v|out)_proj|mlp\.(fc1|fc2)))	8
+VMDLmL	416	35271168	(?:model\.paligemma_with_expert\.paligemma\.model\.vision_tower\.vision_model\.encoder\.layers\.[0-9]+\.self_attn\.(q|k|v|out)_proj)|(?:model\.paligemma_with_expert\.paligemma\.model\.vision_tower\.vision_model\.encoder\.layers\.[0-9]+\.mlp\.(fc1|fc2))|(?:(.*\.gemma_expert\..*\.self_attn\.(q|k|v|o)_proj|.*\.gemma_expert\..*\.mlp\.(gate|up|down)_proj|model\.(action_in_proj|action_out_proj)))|(?:model\.paligemma_with_expert\.paligemma\.model\.language_model\.layers\.[0-9]+\.mlp\.(gate|up|down)_proj)|(?:model\.paligemma_with_expert\.paligemma\.model\.language_model\.layers\.[0-9]+\.self_attn\.(q|k|v|o)_proj)	16
+M	54	2356992	model\.paligemma_with_expert\.paligemma\.model\.vision_tower\.vision_model\.encoder\.layers\.[0-9]+\.mlp\.(fc1|fc2)	8
